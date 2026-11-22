@@ -6,14 +6,249 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Find project folder
-        id: p
+      - name: Create project files
         run: |
-          f="$(find . -name settings.gradle.kts -not -path './.git/*' | head -1)"
-          if [ -z "$f" ]; then echo "settings.gradle.kts not found - files were not uploaded"; exit 1; fi
-          echo "dir=$(dirname "$f")" >> "$GITHUB_OUTPUT"
-          echo "Project folder: $(dirname "$f")"
+          mkdir -p proj && cd proj
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "BackgroundCam"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.bgcam"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.bgcam"
+                  minSdk = 30
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.android.material:material:1.12.0")
+              implementation("androidx.camera:camera-core:1.3.4")
+              implementation("androidx.camera:camera-camera2:1.3.4")
+              implementation("androidx.camera:camera-lifecycle:1.3.4")
+              implementation("androidx.camera:camera-video:1.3.4")
+              implementation("androidx.lifecycle:lifecycle-service:2.8.7")
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-feature android:name="android.hardware.camera" android:required="true" />
+
+              <application
+                  android:label="BackgroundCam"
+                  android:theme="@style/Theme.Material3.DayNight.NoActionBar">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".RecordService"
+                      android:exported="false"
+                      android:foregroundServiceType="camera|microphone" />
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/example/bgcam
+          cat > app/src/main/java/com/example/bgcam/MainActivity.kt <<'EOF'
+          package com.example.bgcam
+
+          import android.Manifest
+          import android.content.Intent
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.content.ContextCompat
+
+          class MainActivity : AppCompatActivity() {
+
+              private val perms = buildList {
+                  add(Manifest.permission.CAMERA)
+                  add(Manifest.permission.RECORD_AUDIO)
+                  if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+              }.toTypedArray()
+
+              private val permLauncher =
+                  registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { r ->
+                      if (r.values.all { it }) startRecording()
+                  }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val start = Button(this).apply {
+                      text = "Start background recording"
+                      setOnClickListener { permLauncher.launch(perms) }
+                  }
+                  val stop = Button(this).apply {
+                      text = "Stop recording"
+                      setOnClickListener {
+                          startService(Intent(this@MainActivity, RecordService::class.java)
+                              .setAction(RecordService.ACTION_STOP))
+                      }
+                  }
+                  setContentView(LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER
+                      setPadding(48, 48, 48, 48)
+                      addView(start); addView(stop)
+                  })
+              }
+
+              // Must be started while the app is in the foreground (Android 11+ rule).
+              private fun startRecording() {
+                  ContextCompat.startForegroundService(this, Intent(this, RecordService::class.java))
+                  moveTaskToBack(true) // send app to background; recording continues
+              }
+          }
+          EOF
+          mkdir -p app/src/main/java/com/example/bgcam
+          cat > app/src/main/java/com/example/bgcam/RecordService.kt <<'EOF'
+          package com.example.bgcam
+
+          import android.app.*
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.provider.MediaStore
+          import androidx.camera.lifecycle.ProcessCameraProvider
+          import androidx.camera.video.*
+          import androidx.camera.core.CameraSelector
+          import androidx.core.app.NotificationCompat
+          import androidx.core.app.ServiceCompat
+          import androidx.core.content.ContextCompat
+          import androidx.lifecycle.LifecycleService
+
+          class RecordService : LifecycleService() {
+
+              companion object {
+                  const val ACTION_STOP = "com.example.bgcam.STOP"
+                  private const val CHANNEL = "bgcam"
+              }
+
+              private var recording: Recording? = null
+              private var provider: ProcessCameraProvider? = null
+
+              override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+                  super.onStartCommand(intent, flags, startId)
+                  if (intent?.action == ACTION_STOP) {
+                      recording?.stop(); recording = null
+                      stopSelf()
+                      return START_NOT_STICKY
+                  }
+                  showNotification()
+                  startRecording()
+                  return START_NOT_STICKY
+              }
+
+              private fun showNotification() {
+                  val nm = getSystemService(NotificationManager::class.java)
+                  nm.createNotificationChannel(
+                      NotificationChannel(CHANNEL, "Recording", NotificationManager.IMPORTANCE_LOW))
+
+                  val stopIntent = PendingIntent.getService(
+                      this, 0, Intent(this, RecordService::class.java).setAction(ACTION_STOP),
+                      PendingIntent.FLAG_IMMUTABLE)
+
+                  val n = NotificationCompat.Builder(this, CHANNEL)
+                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .setContentTitle("Camera is recording")
+                      .setContentText("Tap Stop to finish and save the video")
+                      .setOngoing(true)
+                      .addAction(android.R.drawable.ic_media_pause, "Stop", stopIntent)
+                      .build()
+
+                  ServiceCompat.startForeground(
+                      this, 1, n,
+                      ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+              }
+
+              private fun startRecording() {
+                  val future = ProcessCameraProvider.getInstance(this)
+                  future.addListener({
+                      provider = future.get()
+                      val recorder = Recorder.Builder()
+                          .setQualitySelector(QualitySelector.from(Quality.HD))
+                          .build()
+                      val videoCapture = VideoCapture.withOutput(recorder)
+
+                      provider!!.unbindAll()
+                      provider!!.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, videoCapture)
+
+                      val values = ContentValues().apply {
+                          put(MediaStore.Video.Media.DISPLAY_NAME, "bgcam_${System.currentTimeMillis()}")
+                          put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                          put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/BackgroundCam")
+                      }
+                      val output = MediaStoreOutputOptions.Builder(
+                          contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                      ).setContentValues(values).build()
+
+                      recording = videoCapture.output
+                          .prepareRecording(this, output)
+                          .withAudioEnabled()
+                          .start(ContextCompat.getMainExecutor(this)) { }
+                  }, ContextCompat.getMainExecutor(this))
+              }
+
+              override fun onDestroy() {
+                  recording?.stop()
+                  provider?.unbindAll()
+                  super.onDestroy()
+              }
+          }
+          EOF
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -27,11 +262,11 @@ jobs:
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
+          build-root-directory: proj
       - name: Build
-        working-directory: ${{ steps.p.outputs.dir }}
+        working-directory: proj
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: BackgroundCam-apk
-          path: ${{ steps.p.outputs.dir }}/app/build/outputs/apk/debug/app-debug.apk
-        
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
