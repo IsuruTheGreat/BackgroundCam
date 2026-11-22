@@ -13,8 +13,11 @@ jobs:
           java-version: 17
       - name: Install Android SDK packages
         run: |
-          yes | sdkmanager --licenses > /dev/null || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKM="$(ls $SDK/cmdline-tools/*/bin/sdkmanager | head -1)"
+          echo "Using $SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0"
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
